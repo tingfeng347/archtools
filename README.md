@@ -48,6 +48,7 @@ pack -y               # 强制刷新 AUR 缓存
 pack -c               # 仅审查 AUR 包，不安装
 pack --ai-model opencode/xxx  # 指定 AI 审查模型
 ```
+- 注意：第一次启动时比较慢，稍微等待一下
 
 ### pacr - 卸载
 
