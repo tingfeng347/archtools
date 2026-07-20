@@ -6,6 +6,46 @@ set -euo pipefail
 
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
 export LC_ALL=C
+export SHELL="${BASH:-/bin/bash}"
+
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+
+# --- 持久列表缓存刷新器 (由 fzf reload 调用) ---
+if [[ "${1:-}" == "--refresh-cache" ]]; then
+    REFRESH_FORCE="$2"
+    PACKAGE_LIST_CACHE="$3"
+    INSTALLED_LIST="$4"
+    AUR_CACHE="$5"
+    AUR_FILTER="$6"
+    FLATPAK_INSTALLED="$7"
+    MSG_INSTALLED="$8"
+    PACMAN_AVAILABLE="$9"
+    AUR_AVAILABLE="${10}"
+    FLATPAK_AVAILABLE="${11}"
+    FLATPAK_FORCE_REFRESH="${12:-false}"
+    PACKAGE_LIST_TMP="${PACKAGE_LIST_CACHE}.tmp.$$"
+
+    cleanup_refresh() {
+        rm -f -- "$PACKAGE_LIST_TMP"
+    }
+    trap cleanup_refresh EXIT INT TERM
+
+    mkdir -p "$(dirname "$PACKAGE_LIST_CACHE")"
+    if bash "$SCRIPT_PATH" --generate-list "$REFRESH_FORCE" "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" \
+        "$FLATPAK_INSTALLED" "$MSG_INSTALLED" "$PACMAN_AVAILABLE" "$AUR_AVAILABLE" \
+        "$FLATPAK_AVAILABLE" "$FLATPAK_FORCE_REFRESH" > "$PACKAGE_LIST_TMP" 2>/dev/null
+    then
+        mv -f -- "$PACKAGE_LIST_TMP" "$PACKAGE_LIST_CACHE"
+        cat -- "$PACKAGE_LIST_CACHE"
+        exit 0
+    fi
+
+    if [[ -s "$PACKAGE_LIST_CACHE" ]]; then
+        cat -- "$PACKAGE_LIST_CACHE"
+        exit 0
+    fi
+    exit 1
+fi
 
 # --- 0. 内部生成器拦截 (由 fzf reload 触发) ---
 if [[ "${1:-}" == "--generate-list" ]]; then
@@ -19,6 +59,7 @@ if [[ "${1:-}" == "--generate-list" ]]; then
     PACMAN_AVAILABLE="$8"
     AUR_AVAILABLE="$9"
     FLATPAK_AVAILABLE="${10}"
+    FLATPAK_FORCE_REFRESH="${11:-false}"
 
     # 输出格式: <可见列(带颜色)>\t<src>\t<pkg>
     # fzf 用 --with-nth=1 只显示第一列，src/pkg 作为隐藏字段供预览和选中解析使用
@@ -56,8 +97,10 @@ if [[ "${1:-}" == "--generate-list" ]]; then
             NEED_UPDATE=true
         fi
         if [[ "$NEED_UPDATE" == true ]]; then
-            TEMP_AUR="${AUR_CACHE}.tmp"
-            if curl -sLf --connect-timeout 5 https://aur.archlinux.org/packages.gz | zcat > "$TEMP_AUR" 2>/dev/null; then
+            TEMP_AUR="${AUR_CACHE}.tmp.$$"
+            if curl -sLf --connect-timeout 2 --max-time 10 --retry 1 \
+                https://aur.archlinux.org/packages.gz | zcat > "$TEMP_AUR" 2>/dev/null
+            then
                 mv "$TEMP_AUR" "$AUR_CACHE"
             else
                 rm -f "$TEMP_AUR"
@@ -75,9 +118,14 @@ if [[ "${1:-}" == "--generate-list" ]]; then
     # Flatpak
     if [[ "$FLATPAK_AVAILABLE" == true ]]; then
         flatpak list --app --columns=application > "$FLATPAK_INSTALLED" 2>/dev/null || true
-        RAW_DATA=$(flatpak remote-ls --app --cached --columns=origin,application,name 2>/dev/null || true)
-        if [[ -z "$RAW_DATA" ]]; then
-            RAW_DATA=$(flatpak remote-ls --app --columns=origin,application,name 2>/dev/null || true)
+        if [[ "$FLATPAK_FORCE_REFRESH" == true ]]; then
+            RAW_DATA=$(timeout 10s flatpak remote-ls --app --columns=origin,application,name 2>/dev/null || true)
+            if [[ -z "$RAW_DATA" ]]; then
+                RAW_DATA=$(flatpak remote-ls --app --cached --columns=origin,application,name 2>/dev/null || true)
+            fi
+        else
+            # 自动刷新只读本地 AppStream 缓存，避免网络阻塞首屏。
+            RAW_DATA=$(flatpak remote-ls --app --cached --columns=origin,application,name 2>/dev/null || true)
         fi
         if [[ -n "$RAW_DATA" ]]; then
             echo "$RAW_DATA" | \
@@ -121,8 +169,6 @@ fi
 if [[ -n "${PAC_OPENCODE_MODEL:-}" ]]; then
     OPENCODE_MODEL="$PAC_OPENCODE_MODEL"
 fi
-
-SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
 
 # --- 2. 参数解析 ---
 while [[ $# -gt 0 ]]; do
@@ -324,6 +370,12 @@ mkdir -p "$CACHE_DIR"
 
 AUR_CACHE="${CACHE_DIR}/aur_packages.gz.txt"
 AUR_FILTER='^(mingw-|lib32-|cross-|.*-debug$)'
+if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
+    CACHE_LOCALE="zh_CN"
+else
+    CACHE_LOCALE="en"
+fi
+PACKAGE_LIST_CACHE="${CACHE_DIR}/package-list-v1-${CACHE_LOCALE}.tsv"
 
 # Preview AWK: 给属性键加粗青色高亮
 AWK_PREVIEW='{
@@ -464,10 +516,24 @@ abort() {
 trap cleanup EXIT
 trap abort INT TERM
 
-# --- 7. 数据生成器 (同步写入列表文件) ---
-"$SCRIPT_PATH" --generate-list "$FORCE_REFRESH" "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" \
-    "$FLATPAK_INSTALLED" "${MSG[INSTALLED]}" "$PACMAN_AVAILABLE" "$AUR_AVAILABLE" "$FLATPAK_AVAILABLE" \
-    > "$LIST_FILE" 2>/dev/null
+# --- 7. 快速首屏：先读取持久缓存，完整列表在 fzf 内后台刷新 ---
+if [[ -s "$PACKAGE_LIST_CACHE" ]]; then
+    cp -- "$PACKAGE_LIST_CACHE" "$LIST_FILE"
+    START_RELOAD_ACTION="reload-sync"
+else
+    : > "$LIST_FILE"
+    START_RELOAD_ACTION="reload"
+fi
+
+printf -v AUTO_REFRESH_CMD '%q ' bash "$SCRIPT_PATH" --refresh-cache "$FORCE_REFRESH" \
+    "$PACKAGE_LIST_CACHE" "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "$FLATPAK_INSTALLED" \
+    "${MSG[INSTALLED]}" "$PACMAN_AVAILABLE" "$AUR_AVAILABLE" "$FLATPAK_AVAILABLE" false
+AUTO_REFRESH_CMD="${AUTO_REFRESH_CMD% }"
+
+printf -v FORCE_REFRESH_CMD '%q ' bash "$SCRIPT_PATH" --refresh-cache true \
+    "$PACKAGE_LIST_CACHE" "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "$FLATPAK_INSTALLED" \
+    "${MSG[INSTALLED]}" "$PACMAN_AVAILABLE" "$AUR_AVAILABLE" "$FLATPAK_AVAILABLE" true
+FORCE_REFRESH_CMD="${FORCE_REFRESH_CMD% }"
 
 # --- 8. FZF 渲染 (支持 Ctrl+E 切换精确/模糊) ---
 COLOR_YELLOW=$'\033[33m'
@@ -484,9 +550,10 @@ else
     FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}${BACKEND_LABEL}${COLOR_RESET}"
 fi
 
-PREVIEW_CMD="export LC_ALL=\"$ORIGINAL_LANG\"; line={}; src=\$(printf '%s' \"\$line\" | awk -F'\t' '{print \$2}'); pkg=\$(printf '%s' \"\$line\" | awk -F'\t' '{print \$3}'); if [[ \"\$src\" == flat:* ]]; then remote=\"\${src#flat:}\"; flatpak remote-info \"\$remote\" \"\$pkg\" | awk '{ sub(/^[ \\t]*[^:：]*[:：]/, \"\\033[36m&\\033[0m\"); print }'; elif [[ -n \"$AUR_HELPER\" ]]; then $AUR_HELPER --color=always -Si \"\$pkg\" | awk -v c=\"\$(printf '\\033[1;36m')\" -v r=\"\$(printf '\\033[0m')\" '$AWK_PREVIEW'; else echo 'No preview available'; fi"
+PREVIEW_CMD="export LC_ALL=\"$ORIGINAL_LANG\"; line={}; src=\$(printf '%s' \"\$line\" | awk -F'\t' '{print \$2}'); pkg=\$(printf '%s' \"\$line\" | awk -F'\t' '{print \$3}'); if [[ \"\$src\" == flat:* ]]; then remote=\"\${src#flat:}\"; flatpak remote-info \"\$remote\" \"\$pkg\" | awk '{ sub(/^[ \\t]*[^:：]*[:：]/, \"\\033[36m&\\033[0m\"); print }'; elif [[ \"\$src\" == aur && -n \"$AUR_HELPER\" ]]; then $AUR_HELPER --color=always -Si \"\$pkg\" | awk -v c=\"\$(printf '\\033[1;36m')\" -v r=\"\$(printf '\\033[0m')\" '$AWK_PREVIEW'; elif command -v pacman >/dev/null 2>&1; then pacman --color=always -Si \"\$src/\$pkg\" | awk -v c=\"\$(printf '\\033[1;36m')\" -v r=\"\$(printf '\\033[0m')\" '$AWK_PREVIEW'; else echo 'No preview available'; fi"
 
 QUERY_TEXT="${QUERY_ARGS[*]:-}"
+FIRST_FZF_RUN=true
 
 while true; do
     FZF_MATCH_OPTIONS=()
@@ -497,17 +564,23 @@ while true; do
         CURRENT_HEADER="${FZF_HEADER} | Mode: Fuzzy"
     fi
 
+    FZF_RELOAD_BIND="ctrl-r:reload-sync($FORCE_REFRESH_CMD)"
+    if [[ "$FIRST_FZF_RUN" == true ]]; then
+        FZF_RELOAD_BIND="start:${START_RELOAD_ACTION}($AUTO_REFRESH_CMD),${FZF_RELOAD_BIND}"
+    fi
+
     set +e
     fzf --multi --ansi \
         "${FZF_MATCH_OPTIONS[@]}" \
         --delimiter=$'\t' \
         --with-nth=1 \
-        --expect=ctrl-e,ctrl-r \
+        --expect=ctrl-e \
         --print-query \
         --preview "$PREVIEW_CMD" \
         --preview-window=down:55%:wrap \
         --height=95% --layout=reverse --border \
         --bind "alt-j:last,alt-k:first" \
+        --bind "$FZF_RELOAD_BIND" \
         --tiebreak=index \
         --header "$CURRENT_HEADER" \
         --query "$QUERY_TEXT" \
@@ -515,13 +588,14 @@ while true; do
         > "$TARGET_FILE"
     FZF_EXIT=$?
     set -e
+    FIRST_FZF_RUN=false
 
     FZF_KEY=""
     if [[ -s "$TARGET_FILE" ]]; then
         FZF_LINE1="$(sed -n '1p' "$TARGET_FILE")"
         FZF_LINE2="$(sed -n '2p' "$TARGET_FILE")"
-        if [[ "$FZF_LINE1" == "ctrl-e" || "$FZF_LINE1" == "ctrl-r" || "$FZF_LINE2" == "ctrl-e" || "$FZF_LINE2" == "ctrl-r" ]]; then
-            if [[ "$FZF_LINE1" == "ctrl-e" || "$FZF_LINE1" == "ctrl-r" ]]; then
+        if [[ "$FZF_LINE1" == "ctrl-e" || "$FZF_LINE2" == "ctrl-e" ]]; then
+            if [[ "$FZF_LINE1" == "ctrl-e" ]]; then
                 FZF_KEY="$FZF_LINE1"
                 QUERY_TEXT="$FZF_LINE2"
             else
@@ -539,13 +613,9 @@ while true; do
         else
             FZF_EXACT=true
         fi
-        continue
-    fi
-
-    if [[ $FZF_EXIT -eq 0 && "$FZF_KEY" == "ctrl-r" ]]; then
-        "$SCRIPT_PATH" --generate-list true "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" \
-            "$FLATPAK_INSTALLED" "${MSG[INSTALLED]}" "$PACMAN_AVAILABLE" "$AUR_AVAILABLE" "$FLATPAK_AVAILABLE" \
-            > "$LIST_FILE" 2>/dev/null
+        if [[ -s "$PACKAGE_LIST_CACHE" ]]; then
+            cp -- "$PACKAGE_LIST_CACHE" "$LIST_FILE"
+        fi
         continue
     fi
 

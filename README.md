@@ -76,6 +76,15 @@ pacd -e linux         # 关闭模糊匹配
 | `Ctrl+E` | 切换精确匹配/模糊匹配 |
 | `Esc` | 退出 |
 
+## 快速启动缓存
+
+`pack` 会把最终的软件包列表缓存在 `~/.cache/pac_tui/`。再次启动时会立即显示上一次的列表，
+并在 TUI 内后台更新 Pacman、AUR 与 Flatpak 数据；刷新完成后列表会自动替换，不会阻塞首屏。
+
+- `Ctrl+R`：在当前 TUI 内强制刷新 AUR 与 Flatpak 远程数据。
+- `pack -y`：启动后在后台强制刷新 AUR 缓存。
+- 网络不可用时继续使用已有缓存，不影响打开 TUI。
+
 ## AI 安全审查
 
 安装 AUR 包前，`pack` 会询问是否调用 `opencode` 对 `PKGBUILD` 进行安全审查：
