@@ -56,6 +56,7 @@ pack --ai-model opencode/xxx  # 指定 AI 审查模型
 pacr                  # 打开 TUI，卸载已安装包
 pacr firefox          # 搜索并卸载 firefox
 pacr -e firefox       # 关闭模糊匹配
+pacr -y               # 在后台强制重建列表缓存
 ```
 
 ### pacd - 降级
@@ -64,6 +65,7 @@ pacr -e firefox       # 关闭模糊匹配
 pacd                  # 打开 TUI，降级已安装包
 pacd linux            # 搜索并降级 linux 内核
 pacd -e linux         # 关闭模糊匹配
+pacd -y               # 在后台强制重建列表缓存
 ```
 
 ## 热键
@@ -78,11 +80,12 @@ pacd -e linux         # 关闭模糊匹配
 
 ## 快速启动缓存
 
-`pack` 会把最终的软件包列表缓存在 `~/.cache/pac_tui/`。再次启动时会立即显示上一次的列表，
-并在 TUI 内后台更新 Pacman、AUR 与 Flatpak 数据；刷新完成后列表会自动替换，不会阻塞首屏。
+`pack`、`pacr` 与 `pacd` 会把最终的软件包列表缓存在 `~/.cache/pac_tui/`。再次启动时会立即显示上一次的列表，
+并在 TUI 内后台更新数据；刷新完成后列表会自动替换，不会阻塞首屏。
 
-- `Ctrl+R`：在当前 TUI 内强制刷新 AUR 与 Flatpak 远程数据。
+- `Ctrl+R`：`pack` 强制刷新 AUR 与 Flatpak 远程数据；`pacr`、`pacd` 强制重建当前已安装软件包列表。
 - `pack -y`：启动后在后台强制刷新 AUR 缓存。
+- `pacr -y`、`pacd -y`：启动后在后台强制重建当前已安装软件包列表缓存。
 - 网络不可用时继续使用已有缓存，不影响打开 TUI。
 
 ## AI 安全审查

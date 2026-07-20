@@ -10,6 +10,27 @@ export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells || echo "/bin/bash")
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
 export LC_ALL=C
 
+# --- 持久列表缓存刷新器 (由 fzf reload 调用) ---
+if [[ "${1:-}" == "--refresh-cache" ]]; then
+    PACKAGE_LIST_CACHE="$2"
+    PACKAGE_LIST_TMP="${PACKAGE_LIST_CACHE}.tmp.$$"
+    cleanup_refresh() { rm -f -- "$PACKAGE_LIST_TMP"; }
+    trap cleanup_refresh EXIT INT TERM
+
+    mkdir -p "$(dirname "$PACKAGE_LIST_CACHE")"
+    if command -v pacman >/dev/null 2>&1 && pacman -Qq >/dev/null 2>&1 && \
+        bash "$SCRIPT_PATH" --generate-data > "$PACKAGE_LIST_TMP" 2>/dev/null && \
+        [[ -s "$PACKAGE_LIST_TMP" ]]; then
+        mv -f -- "$PACKAGE_LIST_TMP" "$PACKAGE_LIST_CACHE"
+        cat -- "$PACKAGE_LIST_CACHE"
+        exit 0
+    fi
+
+    # 数据源暂不可用时继续使用已有缓存，避免阻塞或清空 TUI。
+    [[ -s "$PACKAGE_LIST_CACHE" ]] && cat -- "$PACKAGE_LIST_CACHE" && exit 0
+    exit 1
+fi
+
 # --- 1. 隐藏的内部调用：用于生成/刷新数据 ---
 # 输出格式: <可见列(带颜色)>\t<src>\t<pkg>
 # src 取值: pacman / aur / flatpak
@@ -67,11 +88,13 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[DESC]="统一模糊搜索并卸载系统软件包 (支持 Pacman/AUR 与 Flatpak)。"
     MSG[OPTS]="选项："
     MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
+    MSG[OPT_REFRESH]="  --refresh, -y 强制在后台重建软件包列表缓存"
     MSG[OPT_EXACT]="  --exact, -e   关闭模糊匹配，使用精确匹配模式"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 大一统架构：同屏混合显示并多选 Native 包与 Flatpak 应用"
     MSG[FEAT_2]="- 彻底与安全：Pacman 递归删除配置 (-Rns)，Flatpak 原生防误删保护"
     MSG[FEAT_3]="- 视觉标识：蓝色(官方源) | 紫色(AUR) | 青色(Flatpak)"
+    MSG[FEAT_4]="- 快速启动：优先显示上次缓存，并在 TUI 内后台更新列表"
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
@@ -82,11 +105,13 @@ else
     MSG[DESC]="Unified fuzzy search & remove for system packages (Pacman/AUR & Flatpak)."
     MSG[OPTS]="Options:"
     MSG[OPT_HELP]="  --help, -h    Show this help and exit"
+    MSG[OPT_REFRESH]="  --refresh, -y Force rebuilding the package list cache in the background"
     MSG[OPT_EXACT]="  --exact, -e   Disable fuzzy matching and use exact matching mode"
     MSG[FEAT]="Features:"
     MSG[FEAT_1]="- Unified UI: Mix, multi-select and remove Native & Flatpak apps together"
     MSG[FEAT_2]="- Safe & Clean: Pacman recursive remove (-Rns), Flatpak native protection"
     MSG[FEAT_3]="- Visuals: Blue(Repo) | Purple(AUR) | Cyan(Flatpak)"
+    MSG[FEAT_4]="- Fast start: Show the previous cache first and update the list in the TUI"
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
@@ -99,6 +124,7 @@ fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) SHOW_HELP=true; shift ;;
+        --refresh|-y) shift ;;
         --exact|-e) FZF_EXACT=true; shift ;;
         *) QUERY_ARGS+=("$1"); shift ;;
     esac
@@ -129,6 +155,7 @@ Usage: ${0##*/} [options] [query]
 
 ${MSG[OPTS]}
 ${MSG[OPT_HELP]}
+${MSG[OPT_REFRESH]}
 ${MSG[OPT_EXACT]}
 
 Description:
@@ -138,6 +165,7 @@ ${MSG[FEAT]}
   ${MSG[FEAT_1]}
   ${MSG[FEAT_2]}
   ${MSG[FEAT_3]}
+  ${MSG[FEAT_4]}
 
 ${MSG[EX]}
   ${0##*/} firefox        # 搜索并卸载 'firefox' (无缝跨越两端)
@@ -151,6 +179,9 @@ fi
 TMP_DIR=$(mktemp -d -t unified_pacr.XXXXXX)
 TARGET_FILE="${TMP_DIR}/target"
 LIST_FILE="${TMP_DIR}/list"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pac_tui"
+PACKAGE_LIST_CACHE="${CACHE_DIR}/pacr-list-v1.tsv"
+mkdir -p "$CACHE_DIR"
 
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT INT TERM
@@ -166,8 +197,18 @@ if [ "$HAS_FLATPAK" = true ]; then
     FZF_HEADER+=" & ${COLOR_CYAN}Flatpak${COLOR_RESET}"
 fi
 
-"$SCRIPT_PATH" --generate-data > "$LIST_FILE"
+# 快速首屏：先显示持久缓存，再由 fzf 在后台更新当前已安装包列表。
+if [[ -s "$PACKAGE_LIST_CACHE" ]]; then
+    cp -- "$PACKAGE_LIST_CACHE" "$LIST_FILE"
+    START_RELOAD_ACTION="reload-sync"
+else
+    : > "$LIST_FILE"
+    START_RELOAD_ACTION="reload"
+fi
+printf -v REFRESH_CACHE_CMD '%q ' bash "$SCRIPT_PATH" --refresh-cache "$PACKAGE_LIST_CACHE"
+REFRESH_CACHE_CMD="${REFRESH_CACHE_CMD% }"
 QUERY_TEXT="${QUERY_ARGS[*]:-}"
+FIRST_FZF_RUN=true
 
 while true; do
     FZF_MATCH_OPTIONS=()
@@ -177,18 +218,23 @@ while true; do
     else
         CURRENT_HEADER="${FZF_HEADER} | Mode: Fuzzy"
     fi
+    FZF_RELOAD_BIND="ctrl-r:reload-sync($REFRESH_CACHE_CMD)"
+    if [[ "$FIRST_FZF_RUN" == true ]]; then
+        FZF_RELOAD_BIND="start:${START_RELOAD_ACTION}($REFRESH_CACHE_CMD),${FZF_RELOAD_BIND}"
+    fi
 
     set +e
     fzf --multi --ansi \
         "${FZF_MATCH_OPTIONS[@]}" \
         --delimiter=$'\t' \
         --with-nth=1 \
-        --expect=ctrl-e,ctrl-r \
+        --expect=ctrl-e \
         --print-query \
         --preview "$PREVIEW_CMD" \
         --preview-window=down:55%:wrap \
         --height=95% --layout=reverse --border \
         --bind "alt-j:last,alt-k:first" \
+        --bind "$FZF_RELOAD_BIND" \
         --tiebreak=index \
         --header "$CURRENT_HEADER" \
         --query "$QUERY_TEXT" \
@@ -196,13 +242,14 @@ while true; do
         > "$TARGET_FILE"
     FZF_EXIT=$?
     set -e
+    FIRST_FZF_RUN=false
 
     FZF_KEY=""
     if [[ -s "$TARGET_FILE" ]]; then
         FZF_LINE1="$(sed -n '1p' "$TARGET_FILE")"
         FZF_LINE2="$(sed -n '2p' "$TARGET_FILE")"
-        if [[ "$FZF_LINE1" == "ctrl-e" || "$FZF_LINE1" == "ctrl-r" || "$FZF_LINE2" == "ctrl-e" || "$FZF_LINE2" == "ctrl-r" ]]; then
-            if [[ "$FZF_LINE1" == "ctrl-e" || "$FZF_LINE1" == "ctrl-r" ]]; then
+        if [[ "$FZF_LINE1" == "ctrl-e" || "$FZF_LINE2" == "ctrl-e" ]]; then
+            if [[ "$FZF_LINE1" == "ctrl-e" ]]; then
                 FZF_KEY="$FZF_LINE1"
                 QUERY_TEXT="$FZF_LINE2"
             else
@@ -220,11 +267,7 @@ while true; do
         else
             FZF_EXACT=true
         fi
-        continue
-    fi
-
-    if [[ $FZF_EXIT -eq 0 && "$FZF_KEY" == "ctrl-r" ]]; then
-        "$SCRIPT_PATH" --generate-data > "$LIST_FILE"
+        [[ -s "$PACKAGE_LIST_CACHE" ]] && cp -- "$PACKAGE_LIST_CACHE" "$LIST_FILE"
         continue
     fi
 
